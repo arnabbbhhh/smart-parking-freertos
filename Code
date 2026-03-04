@@ -1,0 +1,450 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Smart Parking System with FreeRTOS
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "semphr.h"
+#include <stdio.h>
+/* USER CODE END Includes */
+
+/* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim4;
+UART_HandleTypeDef huart2;
+
+/* Definitions for RTOS tasks */
+osThreadId_t defaultTaskHandle;
+osThreadId_t irSensorTaskHandle;
+osThreadId_t gateServoTaskHandle;
+osThreadId_t loggerTaskHandle;
+
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+const osThreadAttr_t irSensorTask_attributes = {
+  .name = "IRSensorTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+const osThreadAttr_t gateServoTask_attributes = {
+  .name = "GateServoTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+
+const osThreadAttr_t loggerTask_attributes = {
+  .name = "LoggerTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityBelowNormal,
+};
+
+/* USER CODE BEGIN PV */
+QueueHandle_t parkingQueue;
+QueueHandle_t servoQueue;
+SemaphoreHandle_t uartMutex;
+
+// ============ GLOBAL VARIABLES FOR LIVE EXPRESSIONS ============
+volatile uint8_t g_sensor1_PA0 = 0;    // Parking Spot 1: 1 = CAR, 0 = FREE
+volatile uint8_t g_sensor2_PA1 = 0;    // Parking Spot 2
+volatile uint8_t g_sensor3_PA6 = 0;    // Parking Spot 3
+volatile uint8_t g_sensor4_PA7 = 0;    // Parking Spot 4
+volatile uint8_t g_all_sensors = 0;    // Combined sensor status (binary)
+volatile uint8_t g_occupied_spots = 0;  // Cars detected
+volatile uint8_t g_available_spots = 4; // Free spots
+
+// Servo positions
+volatile uint16_t g_servo1_position = 1500;
+volatile uint16_t g_servo2_position = 1500;
+
+// Raw sensor pin states
+volatile GPIO_PinState g_pin_PA0_raw = GPIO_PIN_RESET;
+volatile GPIO_PinState g_pin_PA1_raw = GPIO_PIN_RESET;
+volatile GPIO_PinState g_pin_PA6_raw = GPIO_PIN_RESET;
+volatile GPIO_PinState g_pin_PA7_raw = GPIO_PIN_RESET;
+// ================================================================
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_USART2_UART_Init(void);
+void StartDefaultTask(void *argument);
+
+/* USER CODE BEGIN PFP */
+void IRSensorTask(void *argument);
+void GateServoTask(void *argument);
+void LoggerTask(void *argument);
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 0 */
+int _write(int file, char *ptr, int len)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, HAL_MAX_DELAY);
+    return len;
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* MCU Configuration--------------------------------------------------------*/
+  HAL_Init();
+  SystemClock_Config();
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_TIM4_Init();
+  MX_USART2_UART_Init();
+
+  /* USER CODE BEGIN 2 */
+  // Create queues BEFORE kernel initialization
+  parkingQueue = xQueueCreate(5, sizeof(uint8_t));
+  servoQueue = xQueueCreate(5, sizeof(uint16_t) * 2);  // Store both servo positions
+  uartMutex = xSemaphoreCreateMutex();
+
+  // Verify queue and mutex creation
+  if(parkingQueue == NULL || servoQueue == NULL || uartMutex == NULL)
+  {
+      printf("Failed to create queues/mutex!\r\n");
+      Error_Handler();
+  }
+
+  // Start PWM channels for 2 SG90 servos
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);  // PB6
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);  // PB7
+
+  // Set initial servo position (90° center)
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 1500);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 1500);
+  g_servo1_position = 1500;
+  g_servo2_position = 1500;
+
+  printf("\r\n");
+  printf("===========================================\r\n");
+  printf("   Smart Parking System Initialized\r\n");
+  printf("===========================================\r\n");
+  printf("PWM Started - Servos Ready\r\n");
+  printf("Servo 1: PB6 (TIM4_CH1)\r\n");
+  printf("Servo 2: PB7 (TIM4_CH2)\r\n");
+  printf("\r\n");
+  printf(">>> ADD TO LIVE EXPRESSIONS WINDOW <<<\r\n");
+  printf("g_sensor1_PA0     - Spot 1 (0=Car, 1=Free)\r\n");
+  printf("g_sensor2_PA1     - Spot 2 (0=Car, 1=Free)\r\n");
+  printf("g_sensor3_PA6     - Spot 3 (0=Car, 1=Free)\r\n");
+  printf("g_sensor4_PA7     - Spot 4 (0=Car, 1=Free)\r\n");
+  printf("g_all_sensors     - All sensors (binary)\r\n");
+  printf("g_occupied_spots  - Cars detected count\r\n");
+  printf("g_available_spots - Free spots count\r\n");
+  printf("g_servo1_position - Servo 1 PWM (PB6)\r\n");
+  printf("g_servo2_position - Servo 2 PWM (PB7)\r\n");
+  printf("===========================================\r\n\r\n");
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* Create the thread(s) */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  irSensorTaskHandle = osThreadNew(IRSensorTask, NULL, &irSensorTask_attributes);
+  gateServoTaskHandle = osThreadNew(GateServoTask, NULL, &gateServoTask_attributes);
+  loggerTaskHandle = osThreadNew(LoggerTask, NULL, &loggerTask_attributes);
+
+  // Verify task creation
+  if(defaultTaskHandle == NULL || irSensorTaskHandle == NULL ||
+     gateServoTaskHandle == NULL || loggerTaskHandle == NULL)
+  {
+      printf("Failed to create tasks!\r\n");
+      Error_Handler();
+  }
+
+  printf("All tasks created successfully\r\n\r\n");
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here */
+  while (1)
+  {
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM4 Initialization Function
+  */
+static void MX_TIM4_Init(void)
+{
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 83;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 19999;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_TIM_MspPostInit(&htim4);
+}
+
+/**
+  * @brief USART2 Initialization Function
+  */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief GPIO Initialization Function
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  // IR sensors PA0, PA1, PA6, PA7
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_6|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+/* USER CODE BEGIN 4 */
+void IRSensorTask(void *argument)
+{
+    uint8_t status;
+    uint8_t prevStatus = 0xFF;
+
+    printf("IRSensorTask started\r\n");
+
+    while(1)
+    {
+        g_pin_PA0_raw = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
+        g_pin_PA1_raw = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_1);
+        g_pin_PA6_raw = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6);
+        g_pin_PA7_raw = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7);
+
+        g_sensor1_PA0 = (uint8_t)g_pin_PA0_raw;
+        g_sensor2_PA1 = (uint8_t)g_pin_PA1_raw;
+        g_sensor3_PA6 = (uint8_t)g_pin_PA6_raw;
+        g_sensor4_PA7 = (uint8_t)g_pin_PA7_raw;
+
+        status  = g_sensor1_PA0 << 0;
+        status |= g_sensor2_PA1 << 1;
+        status |= g_sensor3_PA6 << 2;
+        status |= g_sensor4_PA7 << 3;
+        g_all_sensors = status;
+
+        g_occupied_spots = g_sensor1_PA0 + g_sensor2_PA1 + g_sensor3_PA6 + g_sensor4_PA7;
+        g_available_spots = 4 - g_occupied_spots;
+
+        if(status != prevStatus)
+        {
+            xQueueSend(parkingQueue, &status, pdMS_TO_TICKS(10));
+            prevStatus = status;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void GateServoTask(void *argument)
+{
+    uint16_t servo_positions[2];
+
+    printf("GateServoTask started\r\n");
+
+    while(1)
+    {
+        if(xQueueReceive(servoQueue, &servo_positions, portMAX_DELAY) == pdPASS)
+        {
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, servo_positions[0]);
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, servo_positions[1]);
+            g_servo1_position = servo_positions[0];
+            g_servo2_position = servo_positions[1];
+
+            xSemaphoreTake(uartMutex, portMAX_DELAY);
+            printf("Servos moved: Servo1=%d, Servo2=%d\r\n", servo_positions[0], servo_positions[1]);
+            xSemaphoreGive(uartMutex);
+        }
+    }
+}
+
+void LoggerTask(void *argument)
+{
+    uint8_t data;
+    uint8_t spot1, spot2, spot3, spot4;
+
+    printf("LoggerTask started\r\n\r\n");
+
+    while(1)
+    {
+        if(xQueueReceive(parkingQueue, &data, portMAX_DELAY) == pdPASS)
+        {
+            spot1 = (data >> 0) & 1;
+            spot2 = (data >> 1) & 1;
+            spot3 = (data >> 2) & 1;
+            spot4 = (data >> 3) & 1;
+
+            xSemaphoreTake(uartMutex, portMAX_DELAY);
+            printf("===========================================\r\n");
+            printf("        PARKING STATUS UPDATE\r\n");
+            printf("===========================================\r\n");
+            printf("Raw Data: 0x%02X (Binary: %d%d%d%d)\r\n", data, spot4, spot3, spot2, spot1);
+            printf("-------------------------------------------\r\n");
+            printf("Spot 1 (PA0): %s\r\n", spot1 ? "🚗 CAR DETECTED" : "✅ FREE");
+            printf("Spot 2 (PA1): %s\r\n", spot2 ? "🚗 CAR DETECTED" : "✅ FREE");
+            printf("Spot 3 (PA6): %s\r\n", spot3 ? "🚗 CAR DETECTED" : "✅ FREE");
+            printf("Spot 4 (PA7): %s\r\n", spot4 ? "🚗 CAR DETECTED" : "✅ FREE");
+            printf("-------------------------------------------\r\n");
+            printf("Occupied Spots: %d/4\r\n", g_occupied_spots);
+            printf("Available Spots: %d/4\r\n", g_available_spots);
+            printf("Servo1: %d, Servo2: %d\r\n", g_servo1_position, g_servo2_position);
+            printf("===========================================\r\n\r\n");
+            xSemaphoreGive(uartMutex);
+        }
+    }
+}
+
+void StartDefaultTask(void *argument)
+{
+    printf("DefaultTask started\r\n");
+
+    uint16_t servo_positions[2];
+    uint16_t servo_open = 2000;
+    uint16_t servo_close = 1000;
+
+    while(1)
+    {
+        if(g_available_spots == 0)
+        {
+            servo_positions[0] = servo_close;
+            servo_positions[1] = servo_close;
+        }
+        else if(g_available_spots == 4)
+        {
+            servo_positions[0] = servo_open;
+            servo_positions[1] = servo_open;
+        }
+        else
+        {
+            servo_positions[0] = servo_open;
+            servo_positions[1] = servo_open;
+        }
+
+        xQueueSend(servoQueue, &servo_positions, pdMS_TO_TICKS(10));
+        osDelay(2000);
+    }
+}
+
+/**
+  * @brief Error Handler
+  */
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1)
+    {
+    }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif /* USE_FULL_ASSERT */
+
